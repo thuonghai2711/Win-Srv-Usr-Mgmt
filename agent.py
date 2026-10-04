@@ -1,15 +1,25 @@
 # Agent thuần Python cho Windows Server (không gọi PowerShell).
-# Cài:  python setup_agent.py https://panel.2z2.top <TOKEN>
-# Chạy tay:  python agent.py https://panel.2z2.top <TOKEN>   (cần quyền Administrator/SYSTEM)
-import sys, os, re, time, shutil, winreg, requests
+# Cài:  python setup_agent.py https://panel.example.com <TOKEN>
+# Chạy tay:  python agent.py https://panel.example.com <TOKEN>   (cần quyền Administrator/SYSTEM)
+import sys, os, re, json, time, shutil, winreg, requests
 import pywintypes, win32net, win32netcon, win32security, win32profile, win32ts
 
 URL, TOKEN = sys.argv[1].rstrip("/"), sys.argv[2]
 H = {"X-Token": TOKEN}
+STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")   # {user: hạn chót xoá}
 USER_RE = re.compile(r"^[A-Za-z0-9_.-]{3,20}$")
 RESERVED = {"administrator", "guest", "defaultaccount", "wdagutilityaccount"}
 MARK = "webpanel"            # chỉ xoá user do panel tạo (comment = webpanel)
 SID_ADMINS, SID_RDP = "S-1-5-32-544", "S-1-5-32-555"   # dùng SID nên không phụ thuộc ngôn ngữ Windows
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+def save_state(s):
+    json.dump(s, open(STATE, "w"))
 
 def group_name(sid_str):
     return win32security.LookupAccountSid(None, win32security.ConvertStringSidToSid(sid_str))[0]
@@ -22,7 +32,7 @@ def get_user(u):
             return None
         raise
 
-def create(u, pw):
+def create(u, pw, ttl_min):
     if not pw or len(pw) < 8:
         return False, "password >= 8 ky tu"
     if get_user(u):
@@ -32,8 +42,14 @@ def create(u, pw):
         "home_dir": None, "comment": MARK, "script_path": None,
         "flags": win32netcon.UF_SCRIPT | win32netcon.UF_DONT_EXPIRE_PASSWD | win32netcon.UF_PASSWD_CANT_CHANGE,
     })
-    # chỉ vào Remote Desktop Users, KHÔNG thêm Administrators
-    win32net.NetLocalGroupAddMembers(None, group_name(SID_RDP), 3, [{"domainandname": u}])
+    try:   # chỉ vào Remote Desktop Users, KHÔNG thêm Administrators
+        win32net.NetLocalGroupAddMembers(None, group_name(SID_RDP), 3, [{"domainandname": u}])
+    except Exception:
+        win32net.NetUserDel(None, u)   # lỗi giữa chừng thì dọn luôn
+        raise
+    st = load_state()
+    st[u] = time.time() + ttl_min * 60 + 120   # failsafe: tự xoá dù server chết (hạn server + 2 phút)
+    save_state(st)
     return True, "created " + u
 
 def is_admin(u):
@@ -60,7 +76,7 @@ def profile_path(sid_str):
 def delete(u):
     info = get_user(u)
     if not info:
-        return False, "user khong ton tai"
+        return True, "user da khong ton tai"
     if info["comment"] != MARK:
         return False, "khong phai user do panel tao"
     if is_admin(u):
@@ -85,18 +101,36 @@ def run(j):
         return False, "username khong hop le"
     try:
         if j["action"] == "create":
-            return create(u, j["password"])
+            return create(u, j["password"], float(j.get("ttl_min", 75)))
         if j["action"] == "delete":
-            return delete(u)
+            ok, msg = delete(u)
+            if ok:
+                st = load_state(); st.pop(u, None); save_state(st)
+            return ok, msg
         return False, "action la"
     except Exception as e:
         return False, "loi: %s" % e
+
+def failsafe():
+    st = load_state(); now = time.time()
+    for u, deadline in list(st.items()):
+        if now >= deadline:
+            ok, msg = delete(u)
+            print("failsafe delete", u, ok, msg)
+            if ok or "khong phai" in msg:
+                st.pop(u, None)
+    save_state(st)
 
 while True:
     try:
         for j in requests.get(URL + "/api/jobs", headers=H, timeout=15).json():
             ok, msg = run(j)
-            requests.post(URL + "/api/result", headers=H, json={"id": j["id"], "ok": ok, "msg": msg}, timeout=15)
+            requests.post(URL + "/api/result", headers=H, timeout=15,
+                          json={"id": j["id"], "action": j["action"], "ok": ok, "msg": msg})
     except Exception as e:
         print("err:", e)
+    try:
+        failsafe()
+    except Exception as e:
+        print("failsafe err:", e)
     time.sleep(5)
